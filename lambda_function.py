@@ -17,6 +17,8 @@ s3_client = boto3.client('s3')
 # Constants
 INDEX_NAME = os.environ['PINECONE_INDEX_NAME']
 DIMENSION = 1536  # Titan embedding dimension
+MAX_TOKENS = 300  # Maximum tokens per chunk
+OVERLAP_PERCENTAGE = 20  # Percentage of overlap between chunks
 
 def clean_text(text: str) -> str:
     """
@@ -84,29 +86,52 @@ def get_embedding(text: str) -> List[float]:
         logging.error(f"Error getting embedding: {str(e)}")
         raise
 
-def process_s3_object(bucket: str, key: str) -> Dict[str, Any]:
+def split_into_chunks(text: str, max_tokens: int = MAX_TOKENS, 
+                     overlap_percentage: int = OVERLAP_PERCENTAGE) -> List[str]:
     """
-    Process an S3 object with improved error handling and metadata flattening.
+    Split text into overlapping chunks.
+    Args:
+        text: Input text to split
+        max_tokens: Maximum number of tokens per chunk (approximate by words)
+        overlap_percentage: Percentage of overlap between chunks
+    Returns:
+        List of text chunks
+    """
+    words = text.split()
+    chunk_size = max_tokens
+    overlap_size = int(chunk_size * overlap_percentage / 100)
+    
+    chunks = []
+    start = 0
+    
+    while start < len(words):
+        end = start + chunk_size
+        chunk_words = words[start:end]
+        chunk = ' '.join(chunk_words)
+        chunks.append(chunk)
+        start = start + chunk_size - overlap_size
+    
+    logging.info(f"Split text into {len(chunks)} chunks with {overlap_percentage}% overlap")
+    return chunks
+
+def process_s3_object(bucket: str, key: str) -> List[Dict[str, Any]]:
+    """
+    Process an S3 object with chunking and improved error handling.
     """
     try:
-        # Log attempt to access file
         logging.info(f"Attempting to access s3://{bucket}/{key}")
         
-        # Clean up the key (remove any double slashes or path issues)
+        # Clean up the key
         key = key.lstrip('/').replace('//', '/')
         
         try:
-            # First try to check if object exists
             s3_client.head_object(Bucket=bucket, Key=key)
         except s3_client.exceptions.ClientError as e:
-            if e.response['Error']['Code'] == '404':
-                logging.error(f"Object not found: s3://{bucket}/{key}")
+            error_code = e.response['Error']['Code']
+            if error_code in ['404', '403']:
+                logging.error(f"Access error ({error_code}) for s3://{bucket}/{key}")
                 return None
-            elif e.response['Error']['Code'] == '403':
-                logging.error(f"Permission denied: s3://{bucket}/{key}")
-                return None
-            else:
-                raise
+            raise
 
         # Get object content
         response = s3_client.get_object(Bucket=bucket, Key=key)
@@ -116,36 +141,49 @@ def process_s3_object(bucket: str, key: str) -> Dict[str, Any]:
         acl_info = get_s3_object_acl(bucket, key)
         tags = get_s3_object_tags(bucket, key)
         
-        # Generate embedding
-        embedding = get_embedding(content)
+        # Split content into chunks
+        chunks = split_into_chunks(content)
+        chunk_data = []
         
-        # Prepare metadata with flattened structure
-        metadata = {
-            "source": f"s3://{bucket}/{key}",
-            "content_type": response.get('ContentType', 'text/plain'),
-            "last_modified": response['LastModified'].isoformat(),
-            "size": str(response['ContentLength']),
-            "owner_id": acl_info['owner_id'],
-            "permissions": acl_info['permissions'],
-            "content": content  # Store full content for retrieval
-        }
+        # Process each chunk
+        for i, chunk in enumerate(chunks):
+            # Generate embedding for chunk
+            embedding = get_embedding(chunk)
+            
+            # Prepare metadata
+            metadata = {
+                "source": f"s3://{bucket}/{key}",
+                "content_type": response.get('ContentType', 'text/plain'),
+                "last_modified": response['LastModified'].isoformat(),
+                "size": str(response['ContentLength']),
+                "owner_id": acl_info['owner_id'],
+                "permissions": acl_info['permissions'],
+                "content": chunk,
+                "chunk_index": str(i),
+                "total_chunks": str(len(chunks))
+            }
+            
+            # Add tags
+            for tag_key, tag_value in tags.items():
+                metadata[f"tag_{tag_key}"] = tag_value
+            
+            chunk_data.append({
+                "id": f"{bucket}/{key}/chunk_{i}",
+                "vector": embedding,
+                "metadata": metadata
+            })
+            
+            logging.info(f"Processed chunk {i+1}/{len(chunks)} for {bucket}/{key}")
         
-        # Add tags as top-level metadata with prefix
-        for tag_key, tag_value in tags.items():
-            metadata[f"tag_{tag_key}"] = tag_value
-        
-        return {
-            "id": f"{bucket}/{key}",
-            "vector": embedding,
-            "metadata": metadata
-        }
+        return chunk_data
+    
     except Exception as e:
         logging.error(f"Error processing {bucket}/{key}: {str(e)}", exc_info=True)
         return None
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
-    Lambda handler to process S3 events and update Pinecone index.
+    Lambda handler to process S3 events and update Pinecone index with chunked data.
     """
     try:
         logging.info(f"Processing event: {json.dumps(event)}")
@@ -156,21 +194,29 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             key = unquote_plus(record['s3']['object']['key'])
             
             if record['eventName'].startswith('ObjectCreated'):
-                document_data = process_s3_object(bucket, key)
-                if document_data:
-                    # Upsert to Pinecone
-                    index.upsert(
-                        vectors=[(
-                            document_data['id'],
-                            document_data['vector'],
-                            document_data['metadata']
-                        )]
-                    )
-                    logging.info(f"Successfully processed and uploaded {bucket}/{key}")
+                chunks_data = process_s3_object(bucket, key)
+                if chunks_data:
+                    # Prepare vectors for batch upsert
+                    vectors_to_upsert = [
+                        (chunk['id'], chunk['vector'], chunk['metadata'])
+                        for chunk in chunks_data
+                    ]
+                    
+                    # Upsert in batches of 100
+                    batch_size = 100
+                    for i in range(0, len(vectors_to_upsert), batch_size):
+                        batch = vectors_to_upsert[i:i + batch_size]
+                        index.upsert(vectors=batch)
+                        logging.info(f"Upserted batch {i//batch_size + 1} for {bucket}/{key}")
+                    
+                    logging.info(f"Successfully processed {len(chunks_data)} chunks for {bucket}/{key}")
                     
             elif record['eventName'].startswith('ObjectRemoved'):
-                index.delete(ids=[f"{bucket}/{key}"])
-                logging.info(f"Successfully deleted {bucket}/{key} from index")
+                # Delete all chunks for this document
+                index.delete(filter={
+                    "source": f"s3://{bucket}/{key}"
+                })
+                logging.info(f"Successfully deleted all chunks for {bucket}/{key}")
         
         return {
             'statusCode': 200,
